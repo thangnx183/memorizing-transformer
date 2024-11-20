@@ -7,7 +7,7 @@ import datasets
 # Constants
 SEGMENT = 10           # number of segments
 SEGMENT_LENGTH = 512   # context window length
-CHUNK_SIZE = SEGMENT * SEGMENT_LENGTH
+CHUNK_SIZE = SEGMENT * SEGMENT_LENGTH + 1
 
 def encode_text(s):
     # Using frombuffer instead of fromstring due to deprecation
@@ -22,8 +22,8 @@ def clip_article(article):
 
 def load_and_process_data():
     # Load dataset
-    dataset = datasets.load_dataset("ccdv/arxiv-summarization", split='train',streaming=True)
-    raw_dataset = list(dataset.take(3500))
+    dataset = datasets.load_dataset("ccdv/arxiv-summarization", split='train')
+    raw_dataset = list(dataset.take(7000))
     
     # Extract and filter articles
     articles = [d['article'] for d in raw_dataset]
@@ -47,9 +47,9 @@ def create_model():
         nn.Linear(150, 128)
     )
 
-def train_model(model, data_loader, num_epochs=100):
+def train_model(model, data_loader,model_blocks, num_epochs=100):
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
     model.train()
     device = next(model.parameters()).device
     
@@ -59,16 +59,23 @@ def train_model(model, data_loader, num_epochs=100):
         labels = chunk[:, 1:]
         
         train_loss = 0
-        for seq_segment, labels_segment in zip(seq.chunk(SEGMENT, dim=-1), 
-                                             labels.chunk(SEGMENT, dim=-1)):
-            optimizer.zero_grad()
+        xl_memories = [None] * model_blocks
+        for i, (seq_segment, labels_segment) in enumerate(zip(seq.chunk(SEGMENT, dim=-1), 
+                                             labels.chunk(SEGMENT, dim=-1))):
+            # optimizer.zero_grad()
+            # print(f'debug : {seq_segment.shape,labels_segment.shape}')
             seq_segment = seq_segment.to(device)
             labels_segment = labels_segment.to(device)
-            y_pred = model(seq_segment)
+            y_pred,xl_memories = model(seq_segment,xl_memories)
             loss = loss_fn(y_pred.transpose(2, 1), labels_segment)
-            loss.backward()
-            optimizer.step()
+            # (loss/SEGMENT).backward()
+            retain_graph = (i != SEGMENT - 1)
+            (loss/SEGMENT).backward(retain_graph=retain_graph)
+            # optimizer.step()
             train_loss += loss / SEGMENT
+        
+        optimizer.step()
+        optimizer.zero_grad()
             
         print(f"Epoch {epoch}, Loss: {train_loss}")
 

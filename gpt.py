@@ -19,7 +19,7 @@ sequence_length = 512
 embedding_dimension = 300
 head_dimension = 32
 number_heads = 8
-batch_size = 16
+batch_size = 8
 scaling_factor = head_dimension**-0.5
 
 class MultiHeadsAttention(nn.Module):
@@ -35,43 +35,51 @@ class MultiHeadsAttention(nn.Module):
         self.value_proj = nn.Linear(self.embedding_dimension,self.heads*self.head_dimension)
         self.output_proj = nn.Linear(self.heads*self.head_dimension, self.embedding_dimension)
 
-    def forward(self,input,rel_pos=None):
-        # batch_size,sq_length, _ = input.shape
-        # print('debug : ',input.shape)
-        # query = self.query_proj(input)
-        # key = self.key_proj(input)
-        # value = self.value_proj(input)
-
-        # q = query.reshape(batch_size,sq_length,self.heads,self.head_dimension).transpose(2,1)
-        # k = key.reshape(batch_size,sq_length,self.heads,self.head_dimension).transpose(2,1)
-        # v = value.reshape(batch_size,sq_length,self.heads,self.head_dimension).transpose(2,1)
-        
+    def forward(self,input,rel_pos=None,xl_memory=None):
         q = rearrange(self.query_proj(input),'b h (d k) -> b d h k',k=self.head_dimension )
         k = rearrange(self.key_proj(input),'b h (d k) -> b d h k',k=self.head_dimension)
         v = rearrange(self.value_proj(input),'b h (d k) -> b d h k',k=self.head_dimension)
-        qk = einsum(q,k,'b d i k, b d j k -> b d i j')
-        if rel_pos is not None:
-            qk = qk + rel_pos
-        qk = qk * self.scaling_factor
-        # qk = q@k.transpose(-1,-2)*self.scaling_factor
-
-        ##### position embedding here
-        # qk = qk + relative_position_embedding
         
+        if xl_memory is not None:
+            k_memory,v_memory = xl_memory.unbind(dim=-2)
+            k_memory = rearrange(k_memory,'b h (d k) -> b d h k',k=self.head_dimension)
+            v_memory = rearrange(v_memory,'b h (d k) -> b d h k',k=self.head_dimension)
+            
+            k = torch.cat((k_memory,k),dim=-2)
+            v = torch.cat((v_memory,v),dim=-2)
+            
+            xl_seq_length = k_memory.shape[-2]
+        
+        # print(f'debug qk shape: {q.shape,k.shape}')
+        qk = einsum(q,k,'b d i k, b d j k -> b d i j')
         i,j = qk.shape[-2:]
-        mask = torch.ones((i,j), dtype=torch.bool).triu(1).to(input.device)
+        if rel_pos is not None:
+            # print('debug pos, qk shape: ',rel_pos.shape,qk.shape)
+            qk = qk + rel_pos[...,-i:,-j:]
+        qk = qk * self.scaling_factor
+        
+        
+        mask = torch.ones((i,j), dtype=torch.bool).triu(j-i+1).to(input.device)
         qk_masked = qk.masked_fill(mask,float('-inf'))
         qk_softmax = F.softmax(qk_masked,dim=-1)
 
         # print(qk_softmax.shape, v.shape)
         qkv = einsum(qk_softmax,v,'b d i j,b d j k -> b i d k')
         qkv = rearrange(qkv,'b i d k -> b i (d k)')
-        # new_value = qk_softmax@v
-        # new_value  = new_value.transpose(1,2).reshape(batch_size,sq_length,-1)
 
+        if xl_memory is None:
+            key = rearrange(k,'b d h k -> b h (d k)')
+            value = rearrange(v,'b d h k -> b h (d k)')
+            current_kv_memory = torch.stack((key,value),dim=-2)
+        else:
+            key = rearrange(k,'b d h k -> b h (d k)')
+            value = rearrange(v,'b d h k -> b h (d k)')
+            kv_memory = torch.stack((key,value),dim=-2)
+            current_kv_memory = kv_memory[:,xl_seq_length:]
+        
         output = self.output_proj(qkv)
 
-        return output
+        return output, current_kv_memory
     
 class RelativePosition(nn.Module):
   def __init__(
@@ -102,7 +110,7 @@ class RelativePosition(nn.Module):
   def forward(self, sequence_length):
 
     sequence_pos = torch.arange(sequence_length, dtype=torch.long,device=self.relative_attention_embedding.weight.device)
-    context_pos = torch.arange(sequence_length, dtype=torch.long,device=self.relative_attention_embedding.weight.device)
+    context_pos = torch.arange(-sequence_length,sequence_length, dtype=torch.long,device=self.relative_attention_embedding.weight.device)
     sequence_pos = sequence_pos.reshape(sequence_pos.shape[0], 1)
     rel_pos = context_pos - sequence_pos
 
@@ -115,13 +123,13 @@ class RelativePosition(nn.Module):
     rp_values = rearrange(rp_values,'i j h -> () h i j')
     return rp_values * self.scale
 
-if torch.backends.mps.is_available():
-    print("MPS is available")
-    device = torch.device("mps")
-    torch.manual_seed(seed)
-else:
-    print("MPS is not available")
-    device = torch.device("cpu")
+# if torch.backends.mps.is_available():
+#     print("MPS is available")
+#     device = torch.device("mps")
+#     torch.manual_seed(seed)
+# else:
+#     print("MPS is not available")
+#     device = torch.device("cpu")
 
 class Block(nn.Module):
     def __init__(self,embedding_dimension,heads=8,head_dimension=32,dropout=0.1):
@@ -132,17 +140,21 @@ class Block(nn.Module):
         self.attn_ln = nn.LayerNorm(embedding_dimension)
         self.ffn = nn.Sequential(
             nn.LayerNorm(embedding_dimension),
-            nn.Linear(embedding_dimension,embedding_dimension*4),
+            nn.Linear(embedding_dimension,embedding_dimension*2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(embedding_dimension*4,embedding_dimension),
+            nn.Linear(embedding_dimension*2,embedding_dimension),
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self,x,pos=None):
-        x = x + self.dropout(self.attn(self.attn_ln(x),pos))
+    def forward(self,x,pos=None,xl_memory=None):
+        residual = x 
+        x,xl_memory = self.attn(self.attn_ln(x),pos,xl_memory)
+        x = self.dropout(x)
+        x = residual + x
+        
         x = x + self.ffn(self.ln2(x))
-        return x
+        return x,xl_memory
 
 
 class GPT(nn.Module):
@@ -157,22 +169,27 @@ class GPT(nn.Module):
         
         self.relative_position = RelativePosition(rp_scale=head_dimension**-0.5)
     
-    def forward(self,x):
+    def forward(self,x,xl_memories):
         x = self.token_embedding(x)
         # x = self.blocks(x)
         # print('debug : ',x.shape)
-        for block in self.blocks:
-            x = block(x,self.relative_position(x.shape[1]))
-        
+        new_xl_memories = []
+        for i,block in enumerate(self.blocks):
+            x,new_xl_memory = block(x,self.relative_position(x.shape[1]),xl_memories[i])
+            new_xl_memories.append(new_xl_memory)
         x = self.ln_final(x)
         logits = self.lm_head(x)
-        return logits
+        return logits, new_xl_memories
 
 heads = 8
 head_dimension = 32
 dropout = 0.1
-num_blocks = 2
+num_blocks = 8
 vocab_size = 128
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+
+print(f"Using device: {device}")
+
 model = GPT(embedding_dimension,vocab_size,heads,head_dimension,dropout,num_blocks).to(device)
 
 # loss_fn = nn.CrossEntropyLoss()
@@ -197,7 +214,7 @@ loader = DataLoader(processed_data,batch_size=batch_size,shuffle=True)
 loader = iter(loader)
 
 start_time = time.time()
-train_model(model,loader,num_epochs=10)
+train_model(model,loader,num_blocks,num_epochs=100)
 end_time = time.time()
 print(f"Time taken: {end_time - start_time} seconds")
 
