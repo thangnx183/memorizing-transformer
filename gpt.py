@@ -22,7 +22,7 @@ number_heads = 8
 batch_size = 8
 scaling_factor = head_dimension**-0.5
 
-class MultiHeadsAttention(nn.Module):
+class XLMultiHeadsAttention(nn.Module):
     def __init__(self,embedding_dimension,heads=8,head_dimension=32):
         super().__init__()
         self.heads = heads
@@ -80,6 +80,85 @@ class MultiHeadsAttention(nn.Module):
         output = self.output_proj(qkv)
 
         return output, current_kv_memory
+
+class KnnXLMultiHeadsAttention(nn.Module):
+    def __init__(self,embedding_dimension,knn,heads=8,head_dimension=32):
+        super().__init__()
+        self.heads = heads
+        self.head_dimension = head_dimension
+        self.embedding_dimension = embedding_dimension
+        self.scaling_factor = self.head_dimension**-0.5
+        self.knn = knn
+
+        self.query_proj = nn.Linear(self.embedding_dimension,self.heads*self.head_dimension)
+        self.key_proj = nn.Linear(self.embedding_dimension,self.heads*self.head_dimension)
+        self.value_proj = nn.Linear(self.embedding_dimension,self.heads*self.head_dimension)
+        self.output_proj = nn.Linear(self.heads*self.head_dimension, self.embedding_dimension)
+        self.gate = nn.Parameter(torch.randn(self.heads,1,1))
+
+    def forward(self,input,rel_pos=None,xl_memory=None):
+        q = rearrange(self.query_proj(input),'b h (d k) -> b d h k',k=self.head_dimension )
+        k = rearrange(self.key_proj(input),'b h (d k) -> b d h k',k=self.head_dimension)
+        v = rearrange(self.value_proj(input),'b h (d k) -> b d h k',k=self.head_dimension)
+        
+        if xl_memory is not None:
+            k_memory,v_memory = xl_memory.unbind(dim=-2)
+            k_memory = rearrange(k_memory,'b h (d k) -> b d h k',k=self.head_dimension)
+            v_memory = rearrange(v_memory,'b h (d k) -> b d h k',k=self.head_dimension)
+            
+            k = torch.cat((k_memory,k),dim=-2)
+            v = torch.cat((v_memory,v),dim=-2)
+            
+            xl_seq_length = k_memory.shape[-2]
+        
+        qk = einsum(q,k,'b d i k, b d j k -> b d i j')
+        i,j = qk.shape[-2:]
+        if rel_pos is not None:
+            qk = qk + rel_pos[...,-i:,-j:]
+        qk = qk * self.scaling_factor
+        
+        mask = torch.ones((i,j), dtype=torch.bool).triu(j-i+1).to(input.device)
+        qk_masked = qk.masked_fill(mask,float('-inf'))
+        qk_softmax = F.softmax(qk_masked,dim=-1)
+
+        qkv = einsum(qk_softmax,v,'b h i j,b h j k -> b h i k')
+        # qkv = rearrange(qkv,'b i d k -> b i (d k)')
+        
+        ### knn attention
+        if self.knn.index.ntotal > 0:
+            queries = rearrange(q,'b d h k -> b h (d k)')
+            kv_external_memory = self.knn.search(queries)
+            k_external_memory,v_external_memory = kv_external_memory.unbind(dim=-2)
+            k_external_memory = rearrange(k_external_memory,'b s k (h d) -> b h s k d',d=self.head_dimension)
+            v_external_memory = rearrange(v_external_memory,'b s k (h d) -> b h s k d',d=self.head_dimension)
+            
+            q = rearrange(q,'b s (h d) -> b h s d',d=self.head_dimension)
+            qk_external_memory = einsum(q,k_external_memory,'b h s d, b h s k d -> b h s k')
+            qk_external_memory = qk_external_memory * self.scaling_factor
+            qk_external_memory = F.softmax(qk_external_memory,dim=-1)
+            
+            qkv_external_memory = einsum(qk_external_memory,v_external_memory,'b h s k, b h s k d -> b h s d')
+            
+            self.gate = torch.sigmoid(self.gate)
+            qkv = qkv*self.gate + qkv_external_memory*(1-self.gate)
+            qkv = rearrange(qkv,'b h s d -> b s (h d)')
+        else:
+            qkv = rearrange(qkv,'b h s d -> b s (h d)')
+            
+        if xl_memory is None:
+            key = rearrange(k,'b d h k -> b h (d k)')
+            value = rearrange(v,'b d h k -> b h (d k)')
+            current_kv_memory = torch.stack((key,value),dim=-2)
+        else:
+            key = rearrange(k,'b d h k -> b h (d k)')
+            value = rearrange(v,'b d h k -> b h (d k)')
+            kv_memory = torch.stack((key,value),dim=-2)
+            current_kv_memory = kv_memory[:,xl_seq_length:]
+        
+        output = self.output_proj(qkv)
+        self.knn.add(current_kv_memory)
+
+        return output, current_kv_memory
     
 class RelativePosition(nn.Module):
   def __init__(
@@ -110,7 +189,7 @@ class RelativePosition(nn.Module):
   def forward(self, sequence_length):
 
     sequence_pos = torch.arange(sequence_length, dtype=torch.long,device=self.relative_attention_embedding.weight.device)
-    context_pos = torch.arange(-sequence_length,sequence_length, dtype=torch.long,device=self.relative_attention_embedding.weight.device)
+    context_pos = torch.arange(-sequence_length,sequence_length, dtype=torch.long,device=self.relative_attention_embeddinggit.weight.device)
     sequence_pos = sequence_pos.reshape(sequence_pos.shape[0], 1)
     rel_pos = context_pos - sequence_pos
 
@@ -127,7 +206,7 @@ class RelativePosition(nn.Module):
 #     print("MPS is available")
 #     device = torch.device("mps")
 #     torch.manual_seed(seed)
-# else:
+# else
 #     print("MPS is not available")
 #     device = torch.device("cpu")
 
@@ -136,7 +215,7 @@ class Block(nn.Module):
         super().__init__()  
         # self.ln1 = nn.LayerNorm(embedding_dimension)
         self.ln2 = nn.LayerNorm(embedding_dimension)
-        self.attn = MultiHeadsAttention(embedding_dimension,heads,head_dimension)
+        self.attn = XLMultiHeadsAttention(embedding_dimension,heads,head_dimension)
         self.attn_ln = nn.LayerNorm(embedding_dimension)
         self.ffn = nn.Sequential(
             nn.LayerNorm(embedding_dimension),
