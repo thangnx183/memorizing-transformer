@@ -19,22 +19,24 @@ class KNN_Search:
         self.index = faiss.IndexFlatIP(dim)
         self.data = np.memmap(file_name, dtype=np.float32, mode='w+', shape=(self.batch_size * self.seq_len * 1000, 2, dim))
         self.ids = 0
+        self.device = ('cpu')
 
     def add_data(self,data):
-        data = rearrange(data,'b s c d -> (b s) c d')
-        k,v = data.unbind(dim=-2)
+        self.device = data.device
+        data = rearrange(data,'b s c d -> (b s) c d') # (batch,sequense,2,embed_dim) -> (batch*sequense,2, embed_dim)
+        k,v = data.unbind(dim=-2) # (batch*sequense, embed_dim), (batch*sequense,2, embed_dim)
         len_new_data = data.shape[0]
-        self.data[self.ids:self.ids+len_new_data, :, :] = data.numpy()
-        self.index.add(np.ascontiguousarray(k.numpy()))
+        self.data[self.ids:self.ids+len_new_data, :, :] = data.detach().cpu().numpy()
+        self.index.add(np.ascontiguousarray(k.detach().cpu().numpy())) # (batch*sequense, embed_dim)
         self.ids += len_new_data
         self.data.flush()
     
     def search(self,queries,k=3):
-        queries = rearrange(queries,'b n d -> (b n) d')
-        distances, indices = self.index.search(queries.numpy(), k=k)
+        queries = rearrange(queries,'b n d -> (b n) d') # (batch,sequense,embed_dim) -> (batch*sequense, embed_dim)
+        distances, indices = self.index.search(queries.detach().cpu().numpy(), k=k) # distance : (batch*sequense, topk)
         output = self.data[indices]
-        output = rearrange(output,'(b n) k c d -> b n k c d',n=self.seq_len)
-        output = torch.from_numpy(output)
+        output = rearrange(output,'(b n) k c d -> b n k c d',n=self.seq_len) # (batch*sequense, topk, 2, embed_dim) -> (batch, sequense, topk, 2, embed_dim) | topk kv pair
+        output = torch.from_numpy(output).to(self.device)
 
         return output
 
@@ -48,6 +50,7 @@ class KNN_Search:
 def main():
     knn = KNN_Search(file_name,batch_size,seq_len,dim)
     data = torch.randn(batch_size*10,seq_len,2,dim)
+    print(data.shape)
     knn.add_data(data)
     queries = torch.randn(batch_size,seq_len,dim)
     kv_memory = knn.search(queries,k=3)
