@@ -26,6 +26,14 @@ scaling_factor = head_dimension**-0.5
 
 class XLMultiHeadsAttention(nn.Module):
     def __init__(self, embedding_dimension, heads=8, head_dimension=32):
+        """
+        Initialize the XLMultiHeadsAttention layer.
+
+        Args:
+            embedding_dimension (int): The dimension of the input embeddings.
+            heads (int, optional): The number of attention heads. Defaults to 8.
+            head_dimension (int, optional): The dimension of each attention head. Defaults to 32.
+        """
         super().__init__()
         self.heads = heads
         self.head_dimension = head_dimension
@@ -114,6 +122,15 @@ class XLMultiHeadsAttention(nn.Module):
 
 class KnnXLMultiHeadsAttention(nn.Module):
     def __init__(self, embedding_dimension, knn, heads=8, head_dimension=32):
+        """
+        Initialize the KnnXLMultiHeadsAttention layer.
+
+        Args:
+            embedding_dimension (int): The dimension of the input embeddings.
+            knn (KNN_Search): An instance of the KNN_Search class for external memory retrieval.
+            heads (int, optional): The number of attention heads. Defaults to 8.
+            head_dimension (int, optional): The dimension of each attention head. Defaults to 32.
+        """
         super().__init__()
         self.heads = heads
         self.head_dimension = head_dimension
@@ -144,8 +161,9 @@ class KnnXLMultiHeadsAttention(nn.Module):
             xl_memory (Tensor, optional): kv pair from previous block (batch_size, sequence_length, 2, heads * head_dims). Defaults to None.
 
         Returns:
-            Tensor: output embedding (batch_size, sequence_length, embedding_dim).
-            Tensor: kv memory for later use (batch_size, sequence_length, 2, heads * head_dims)
+            Tuple[Tensor, Tensor]: 
+                - output embedding (batch_size, sequence_length, embedding_dim).
+                - kv memory for later use (batch_size, sequence_length, 2, heads * head_dims)
         """
         q = rearrange(
             F.normalize(self.query_proj(input), dim=-1),
@@ -252,6 +270,15 @@ class KnnXLMultiHeadsAttention(nn.Module):
 
 class RelativePosition(nn.Module):
     def __init__(self, rp_scale, num_buckets=32, rp_max_distance=128, heads=8):
+        """
+        Initialize the RelativePosition layer.
+
+        Args:
+            rp_scale (float): Scaling factor for the relative position embeddings.
+            num_buckets (int, optional): Number of buckets for relative position encoding. Defaults to 32.
+            rp_max_distance (int, optional): Maximum distance for relative position encoding. Defaults to 128.
+            heads (int, optional): Number of attention heads. Defaults to 8.
+        """
         super().__init__()
         self.scale = rp_scale
         self.num_buckets = num_buckets
@@ -259,6 +286,15 @@ class RelativePosition(nn.Module):
         self.relative_attention_embedding = nn.Embedding(num_buckets, heads)
 
     def relative_position_bucket(self, relative_position_matrix):
+        """
+        Map relative positions to buckets for attention.
+
+        Args:
+            relative_position_matrix (Tensor): A tensor containing the relative positions.
+
+        Returns:
+            Tensor: A tensor of bucket indices corresponding to the relative positions.
+        """
         n = -relative_position_matrix
         n = torch.max(n, torch.zeros_like(n))
 
@@ -280,6 +316,15 @@ class RelativePosition(nn.Module):
         return torch.where(is_small, n, val_if_large)
 
     def forward(self, sequence_length):
+        """
+        Compute the relative position embeddings for a given sequence length.
+
+        Args:
+            sequence_length (int): The length of the input sequence.
+
+        Returns:
+            Tensor: The scaled relative position embeddings of shape (1, heads, sequence_length, context_length).
+        """
 
         sequence_pos = torch.arange(
             sequence_length,
@@ -318,6 +363,16 @@ class Block(nn.Module):
     def __init__(
         self, atten_layer, embedding_dimension, heads=8, head_dimension=32, dropout=0.1
     ):
+        """
+        Initialize the Block layer.
+
+        Args:
+            atten_layer (nn.Module): The attention layer to be used in the block.
+            embedding_dimension (int): The dimension of the input embeddings.
+            heads (int, optional): The number of attention heads. Defaults to 8.
+            head_dimension (int, optional): The dimension of each attention head. Defaults to 32.
+            dropout (float, optional): The dropout rate. Defaults to 0.1.
+        """
         super().__init__()
         # self.ln1 = nn.LayerNorm(embedding_dimension)
         self.ln2 = nn.LayerNorm(embedding_dimension)
@@ -334,6 +389,18 @@ class Block(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, pos=None, xl_memory=None):
+        """
+        Forward pass through the Block layer.
+
+        Args:
+            x (Tensor): Input tensor of shape (batch_size, sequence_length, embedding_dimension).
+            pos (Tensor, optional): Relative position embeddings. Defaults to None.
+            xl_memory (Tensor, optional): Memory from previous layers. Defaults to None.
+
+        Returns:
+            Tuple[Tensor, Tensor]: The output tensor after applying attention and feedforward layers,
+                                   and the updated memory tensor.
+        """
         residual = x
         x, xl_memory = self.attn(self.attn_ln(x), pos, xl_memory)
         x = self.dropout(x)
@@ -354,6 +421,18 @@ class memGPT(nn.Module):
         dropout=0.1,
         num_blocks=3,
     ):
+        """
+        Initialize the memGPT model.
+
+        Args:
+            knn (KNN_Search): An instance of the KNN_Search class for external memory retrieval.
+            embedding_dimension (int): The dimension of the input embeddings.
+            vocab_size (int): The size of the vocabulary.
+            heads (int, optional): The number of attention heads. Defaults to 8.
+            head_dimension (int, optional): The dimension of each attention head. Defaults to 32.
+            dropout (float, optional): The dropout rate. Defaults to 0.1.
+            num_blocks (int, optional): The number of blocks in the model. Defaults to 3.
+        """
         super().__init__()
         self.embedding_dimension = embedding_dimension
         self.vocab_size = vocab_size
@@ -383,6 +462,16 @@ class memGPT(nn.Module):
         self.relative_position = RelativePosition(rp_scale=head_dimension**-0.5)
 
     def forward(self, x, xl_memories):
+        """
+        Forward pass through the memGPT model.
+
+        Args:
+            x (Tensor): Input tensor of shape (batch_size, sequence_length).
+            xl_memories (List[Tensor]): List of memory tensors from previous layers.
+
+        Returns:
+            Tuple[Tensor, List[Tensor]]: The output logits for the vocabulary and the updated memory tensors.
+        """
         x = self.token_embedding(x)
         # x = self.blocks(x)
         # print('debug : ',x.shape)
